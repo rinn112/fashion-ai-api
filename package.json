@@ -1,17 +1,13 @@
 {
   "name": "fashion-ai-api",
   "private": true,
-  "type": "module",
-  "engines": {
-    "node": ">=18"
-  },
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "@supabase/supabase-js": "^2.57.0",
-    "@vercel/node": "^5.3.20",
-    "cheerio": "^1.1.2"
+    "@supabase/supabase-js": "^2.45.0",
+    "cheerio": "^1.0.0-rc.12"
   },
   "devDependencies": {
-    "@types/node": "^20.19.12",
-    "typescript": "^5.9.2"
+    "typescript": "^5.5.4",
+    "@types/node": "^20.12.12"
   }
 }
