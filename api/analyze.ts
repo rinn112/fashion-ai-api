@@ -1,4 +1,3 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
 import * as cheerio from 'cheerio';
 import { readFileSync } from 'fs';
 import { join } from 'path';
@@ -109,7 +108,7 @@ function loadCatalog(): { title: string; url: string; imageUrl?: string }[] {
   return JSON.parse(txt);
 }
 
-export default withCORS(async (req: VercelRequest, res: VercelResponse) => {
+export default withCORS(async (req: any, res: any) => {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
   const { imageUrl } = req.body as { imageUrl?: string };
   if (!imageUrl) return res.status(400).json({ error: 'imageUrl required' });
@@ -137,7 +136,7 @@ export default withCORS(async (req: VercelRequest, res: VercelResponse) => {
     const similar = results.slice(0,8);
 
     res.status(200).json({ type, styles, similar });
-  } catch (e:any) {
+  } catch (e: any) {
     res.status(500).json({ error: e?.message || 'server error' });
   }
 });
