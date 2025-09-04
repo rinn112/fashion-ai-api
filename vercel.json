@@ -1,4 +1,3 @@
 {
-  "runtime": "nodejs20.x",
   "regions": ["hnd1"]
 }
