@@ -1,5 +1,10 @@
-import { withCORS } from '../helpers/cors';
+// api/health.ts
+import { VercelRequest, VercelResponse } from '@vercel/node';
 
-export default withCORS(async (_req: any, res: any) => {
-  res.status(200).json({ ok: true, region: process.env.VERCEL_REGION ?? 'unknown' });
-});
+export default function handler(_req: VercelRequest, res: VercelResponse) {
+  res.status(200).json({
+    ok: true,
+    hasHF: Boolean(process.env.HF_TOKEN),
+    hasURL: Boolean(process.env.SUPABASE_URL),
+  });
+}
