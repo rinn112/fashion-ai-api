@@ -1,114 +1,73 @@
 // api/analyze.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { Buffer } from 'node:buffer';
 
-const HF_TOKEN = process.env.HF_TOKEN; // Vercel に登録済みの Hugging Face Access Token
+const HF_TOKEN = process.env.HF_TOKEN!;
+const MODEL = 'microsoft/resnet-50';
+const HF_URL = `https://api-inference.huggingface.co/models/${MODEL}`;
 
-// ① 分類したいラベル（必要に応じて編集）
-const LABELS = [
-  't-shirt', 'shirt', 'sweater', 'hoodie', 'jacket', 'coat',
-  'dress', 'skirt', 'pants', 'jeans', 'shorts',
-  'sneakers', 'shoes', 'boots',
-  'bag', 'backpack', 'hat', 'cap', 'scarf',
-  'watch', 'belt', 'glasses'
-];
+// 画像を Buffer で取得（Node ならこれが一番素直）
+async function fetchImageBuffer(url: string, signal?: AbortSignal): Promise<Buffer> {
+  const r = await fetch(url, { signal });
+  if (!r.ok) throw new Error(`image fetch failed: ${r.status}`);
+  const ab = await r.arrayBuffer();
+  return Buffer.from(ab);
+}
 
-// ② ラベル→リンク先URL のマッピング（ここを “適切なURL” に差し替えていく）
-const CATEGORY_URLS: Record<string, string> = {
-  't-shirt': 'https://example.com/category/t-shirt',
-  'shirt': 'https://example.com/category/shirt',
-  'sweater': 'https://example.com/category/sweater',
-  'hoodie': 'https://example.com/category/hoodie',
-  'jacket': 'https://example.com/category/jacket',
-  'coat': 'https://example.com/category/coat',
-  'dress': 'https://example.com/category/dress',
-  'skirt': 'https://example.com/category/skirt',
-  'pants': 'https://example.com/category/pants',
-  'jeans': 'https://example.com/category/jeans',
-  'shorts': 'https://example.com/category/shorts',
-  'sneakers': 'https://example.com/category/sneakers',
-  'shoes': 'https://example.com/category/shoes',
-  'boots': 'https://example.com/category/boots',
-  'bag': 'https://example.com/category/bag',
-  'backpack': 'https://example.com/category/backpack',
-  'hat': 'https://example.com/category/hat',
-  'cap': 'https://example.com/category/cap',
-  'scarf': 'https://example.com/category/scarf',
-  'watch': 'https://example.com/category/watch',
-  'belt': 'https://example.com/category/belt',
-  'glasses': 'https://example.com/category/glasses'
-};
-
-// HF Inference API（CLIP）エンドポイント
-const HF_ENDPOINT =
-  'https://api-inference.huggingface.co/models/openai/clip-vit-base-patch32?wait_for_model=true';
-
-async function hfZeroShotImageClassify(imageUrl: string, labels: string[]) {
-  const body = {
-    inputs: imageUrl,
-    parameters: { candidate_labels: labels }
-  };
-
-  const res = await fetch(HF_ENDPOINT, {
+// Buffer をそのまま POST（Buffer は Uint8Array なので Node の fetch が受け付ける）
+async function classifyImage(buf: Buffer, signal?: AbortSignal) {
+  const r = await fetch(HF_URL, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${HF_TOKEN}`,
-      'Content-Type': 'application/json'
+      'X-Wait-For-Model': 'true',
+      'Content-Type': 'application/octet-stream',
     },
-    body: JSON.stringify(body)
+    // 型の取り回しで赤線が出る環境向けに as any を付けておくと安全です
+    body: buf as any,
+    signal,
   });
 
-  // モデルのスリープや準備中で 503/504 が返ることがあるので中身は上位でリトライ
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`HF ${res.status}: ${text.slice(0, 300)}`);
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error(`HF ${r.status}: ${t.slice(0, 400)}`);
   }
-
-  // 返り値は [{label, score}, ...] 想定
-  const data = await res.json();
-  return data as Array<{ label: string; score: number }>;
+  const data = await r.json();
+  return Array.isArray(data) ? data : [];
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+// req.body の型赤線対策
+type ReqWithBody = VercelRequest & { body?: any };
+
+export default async function handler(req: ReqWithBody, res: VercelResponse) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
-  if (!HF_TOKEN) return res.status(500).json({ error: 'HF_TOKEN is not set' });
 
   try {
-    const { imageUrl } = (req.body ?? {}) as { imageUrl?: string };
+    const raw = req.body ?? {};
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const { imageUrl } = (parsed as { imageUrl?: string });
+
     if (!imageUrl) return res.status(400).json({ error: 'imageUrl required' });
 
-    // ③ リトライ（モデル起動待ち・一時的な 504/503 に備える）
-    const MAX_RETRY = 3;
-    const SLEEP = (ms: number) => new Promise(r => setTimeout(r, ms));
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), 120_000);
 
-    let result: Array<{ label: string; score: number }> = [];
-    let lastErr: unknown;
+    const t0 = Date.now();
+    const buf = await fetchImageBuffer(imageUrl, ac.signal);
+    const labels = await classifyImage(buf, ac.signal);
+    clearTimeout(to);
 
-    for (let i = 0; i < MAX_RETRY; i++) {
-      try {
-        result = await hfZeroShotImageClassify(imageUrl, LABELS);
-        if (Array.isArray(result) && result.length) break;
-      } catch (e) {
-        lastErr = e;
-        // 次のリトライまで少し待つ
-        await SLEEP(1500 * (i + 1));
-      }
-    }
-
-    if (!result.length) {
-      throw lastErr ?? new Error('classification failed');
-    }
-
-    // ④ 最上位スコアのラベルを採用
-    const top = result[0];
-    const url = CATEGORY_URLS[top.label] ?? 'https://example.com/';
+    const top5 = labels
+      .sort((a: any, b: any) => b.score - a.score)
+      .slice(0, 5)
+      .map((x: any) => ({ label: x.label, score: x.score }));
 
     return res.status(200).json({
       ok: true,
+      model: MODEL,
       imageUrl,
-      topLabel: top.label,
-      score: top.score,
-      url,
-      ranked: result // デバッグ・確認用。不要なら消してOK
+      top5,
+      elapsedMs: Date.now() - t0,
     });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message ?? 'analyze failed' });
