@@ -1,59 +1,116 @@
-const HF_MODEL = 'google/vit-base-patch16-224'; // 起動が速い画像分類
-const HF_API = `https://api-inference.huggingface.co/models/${HF_MODEL}?wait_for_model=true`;
+// api/analyze.ts
+import type { VercelRequest, VercelResponse } from '@vercel/node';
 
-async function callHF(imageUrl: string, signal: AbortSignal) {
-  const resp = await fetch(HF_API, {
+const HF_TOKEN = process.env.HF_TOKEN; // Vercel に登録済みの Hugging Face Access Token
+
+// ① 分類したいラベル（必要に応じて編集）
+const LABELS = [
+  't-shirt', 'shirt', 'sweater', 'hoodie', 'jacket', 'coat',
+  'dress', 'skirt', 'pants', 'jeans', 'shorts',
+  'sneakers', 'shoes', 'boots',
+  'bag', 'backpack', 'hat', 'cap', 'scarf',
+  'watch', 'belt', 'glasses'
+];
+
+// ② ラベル→リンク先URL のマッピング（ここを “適切なURL” に差し替えていく）
+const CATEGORY_URLS: Record<string, string> = {
+  't-shirt': 'https://example.com/category/t-shirt',
+  'shirt': 'https://example.com/category/shirt',
+  'sweater': 'https://example.com/category/sweater',
+  'hoodie': 'https://example.com/category/hoodie',
+  'jacket': 'https://example.com/category/jacket',
+  'coat': 'https://example.com/category/coat',
+  'dress': 'https://example.com/category/dress',
+  'skirt': 'https://example.com/category/skirt',
+  'pants': 'https://example.com/category/pants',
+  'jeans': 'https://example.com/category/jeans',
+  'shorts': 'https://example.com/category/shorts',
+  'sneakers': 'https://example.com/category/sneakers',
+  'shoes': 'https://example.com/category/shoes',
+  'boots': 'https://example.com/category/boots',
+  'bag': 'https://example.com/category/bag',
+  'backpack': 'https://example.com/category/backpack',
+  'hat': 'https://example.com/category/hat',
+  'cap': 'https://example.com/category/cap',
+  'scarf': 'https://example.com/category/scarf',
+  'watch': 'https://example.com/category/watch',
+  'belt': 'https://example.com/category/belt',
+  'glasses': 'https://example.com/category/glasses'
+};
+
+// HF Inference API（CLIP）エンドポイント
+const HF_ENDPOINT =
+  'https://api-inference.huggingface.co/models/openai/clip-vit-base-patch32?wait_for_model=true';
+
+async function hfZeroShotImageClassify(imageUrl: string, labels: string[]) {
+  const body = {
+    inputs: imageUrl,
+    parameters: { candidate_labels: labels }
+  };
+
+  const res = await fetch(HF_ENDPOINT, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${process.env.HF_TOKEN!}`,
-      'Content-Type': 'application/json',
+      Authorization: `Bearer ${HF_TOKEN}`,
+      'Content-Type': 'application/json'
     },
-    body: JSON.stringify({ inputs: imageUrl }),
-    signal,
+    body: JSON.stringify(body)
   });
 
-  if (resp.status === 503) {
-    throw new Error(`HF 503 (model loading): ${await resp.text()}`);
+  // モデルのスリープや準備中で 503/504 が返ることがあるので中身は上位でリトライ
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`HF ${res.status}: ${text.slice(0, 300)}`);
   }
-  if (!resp.ok) {
-    throw new Error(`HF ${resp.status}: ${await resp.text()}`);
-  }
-  return resp.json();
+
+  // 返り値は [{label, score}, ...] 想定
+  const data = await res.json();
+  return data as Array<{ label: string; score: number }>;
 }
 
-export default async function handler(req: any, res: any) {
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
-
-  const { imageUrl } = (req.body || {}) as { imageUrl?: string };
-  if (!imageUrl) return res.status(400).json({ error: 'imageUrl required' });
-
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 60_000);
+  if (!HF_TOKEN) return res.status(500).json({ error: 'HF_TOKEN is not set' });
 
   try {
+    const { imageUrl } = (req.body ?? {}) as { imageUrl?: string };
+    if (!imageUrl) return res.status(400).json({ error: 'imageUrl required' });
+
+    // ③ リトライ（モデル起動待ち・一時的な 504/503 に備える）
+    const MAX_RETRY = 3;
+    const SLEEP = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+    let result: Array<{ label: string; score: number }> = [];
     let lastErr: unknown;
-    for (let i = 0; i < 3; i++) {
+
+    for (let i = 0; i < MAX_RETRY; i++) {
       try {
-        const result = await callHF(imageUrl, ac.signal);
-        clearTimeout(timer);
-        return res.status(200).json({ ok: true, model: HF_MODEL, result });
-      } catch (e: any) {
+        result = await hfZeroShotImageClassify(imageUrl, LABELS);
+        if (Array.isArray(result) && result.length) break;
+      } catch (e) {
         lastErr = e;
-        const msg = String(e?.message ?? '');
-        if (msg.includes('503') || msg.includes('504') || msg.includes('Gateway Timeout')) {
-          await new Promise(r => setTimeout(r, 1500 * (i + 1))); // 1.5s, 3s, 4.5s
-          continue;
-        }
-        throw e;
+        // 次のリトライまで少し待つ
+        await SLEEP(1500 * (i + 1));
       }
     }
-    throw lastErr;
-  } catch (e: any) {
-    clearTimeout(timer);
-    const message = String(e?.message ?? 'analyze failed');
-    const isHtml = /<\/html>/i.test(message) || /<head>/i.test(message);
-    return res.status(500).json({
-      error: isHtml ? 'Hugging Face returned an HTML error page (likely timeout).' : message,
+
+    if (!result.length) {
+      throw lastErr ?? new Error('classification failed');
+    }
+
+    // ④ 最上位スコアのラベルを採用
+    const top = result[0];
+    const url = CATEGORY_URLS[top.label] ?? 'https://example.com/';
+
+    return res.status(200).json({
+      ok: true,
+      imageUrl,
+      topLabel: top.label,
+      score: top.score,
+      url,
+      ranked: result // デバッグ・確認用。不要なら消してOK
     });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message ?? 'analyze failed' });
   }
 }
