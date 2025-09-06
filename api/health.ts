@@ -1,12 +1,28 @@
 // api/health.ts
-import { VercelRequest, VercelResponse } from '@vercel/node';
+import type { VercelRequest, VercelResponse } from '@vercel/node'
 
-export default function handler(_req: VercelRequest, res: VercelResponse) {
-  res.status(200).json({
-    ok: true,
-    region: process.env.VERCEL_REGION,
-    hasHF: Boolean(process.env.HF_TOKEN),
-    hasURL: Boolean(process.env.SUPABASE_URL),
-    hasKey: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
-  });
+export const config = { runtime: 'nodejs' }
+
+export default async function handler(_req: VercelRequest, res: VercelResponse) {
+  try {
+    const hasHF = !!process.env.HF_TOKEN
+    const region = process.env.VERCEL_REGION || 'unknown'
+
+    // 失敗しない・常に JSON で返す
+    res.status(200).json({
+      ok: true,
+      region,
+      hasHF,
+      // 任意のプローブ（増やしたければここに boolean を足す）
+      env: {
+        HF_TOKEN: hasHF ? 'set' : 'missing',
+      },
+    })
+  } catch {
+    // ここも「絶対落とさない」
+    res.status(200).json({
+      ok: false,
+      error: 'health handler error',
+    })
+  }
 }

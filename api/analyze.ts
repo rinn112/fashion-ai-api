@@ -1,75 +1,146 @@
 // api/analyze.ts
-import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { Buffer } from 'node:buffer';
+import type { VercelRequest, VercelResponse } from '@vercel/node'
 
-const HF_TOKEN = process.env.HF_TOKEN!;
-const MODEL = 'microsoft/resnet-50';
-const HF_URL = `https://api-inference.huggingface.co/models/${MODEL}`;
+// Vercel 要件: 'nodejs20.x' ではなく 'nodejs'
+export const config = { runtime: 'nodejs' }
 
-// 画像を Buffer で取得（Node ならこれが一番素直）
-async function fetchImageBuffer(url: string, signal?: AbortSignal): Promise<Buffer> {
-  const r = await fetch(url, { signal });
-  if (!r.ok) throw new Error(`image fetch failed: ${r.status}`);
-  const ab = await r.arrayBuffer();
-  return Buffer.from(ab);
+// ==== 設定 ====
+// HF_TOKEN は Vercel の環境変数に設定（なくても匿名で一部モデルは叩ける）
+const HF_TOKEN = process.env.HF_TOKEN || ''
+
+// とりあえず動作確認用の軽量モデル（画像分類）
+const MODEL = 'microsoft/resnet-50'
+const HF_URL = `https://api-inference.huggingface.co/models/${MODEL}`
+
+// Node の型環境で DOM の AbortSignal 型が無い場合の赤線回避
+type LooseAbortSignal = any
+
+// 画像を ArrayBuffer → Uint8Array で取得（Buffer 不使用で型エラー回避）
+async function fetchImageBytes(url: string, signal?: LooseAbortSignal): Promise<Uint8Array> {
+  const r = await fetch(url as any, { signal } as any)
+  if (!r.ok) throw new Error(`image fetch failed: ${r.status}`)
+  const ab = await r.arrayBuffer()
+  return new Uint8Array(ab)
 }
 
-// Buffer をそのまま POST（Buffer は Uint8Array なので Node の fetch が受け付ける）
-async function classifyImage(buf: Buffer, signal?: AbortSignal) {
-  const r = await fetch(HF_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${HF_TOKEN}`,
-      'X-Wait-For-Model': 'true',
-      'Content-Type': 'application/octet-stream',
-    },
-    // 型の取り回しで赤線が出る環境向けに as any を付けておくと安全です
-    body: buf as any,
-    signal,
-  });
-
-  if (!r.ok) {
-    const t = await r.text().catch(() => '');
-    throw new Error(`HF ${r.status}: ${t.slice(0, 400)}`);
+// HF 呼び出し（コールドスタート/ロード中を考慮して軽くリトライ）
+async function callHuggingFace(bytes: Uint8Array, signal?: LooseAbortSignal) {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/octet-stream',
+    ...(HF_TOKEN ? { Authorization: `Bearer ${HF_TOKEN}` } : {}),
   }
-  const data = await r.json();
-  return Array.isArray(data) ? data : [];
+
+  let lastErr: unknown
+  for (let i = 0; i < 2; i++) {
+    try {
+      const r = await fetch(HF_URL as any, {
+        method: 'POST',
+        headers,
+        body: bytes as any,
+        signal,
+      } as any)
+
+      const ct = r.headers.get('content-type') || ''
+      if (!ct.includes('application/json')) {
+        const text = await r.text()
+        throw new Error(`HF non-JSON: ${r.status} ${text.slice(0, 200)}`)
+      }
+
+      const data = await r.json()
+
+      // モデルロード中シグナル
+      const msg = (data && (data as any).error) || ''
+      if (
+        typeof msg === 'string' &&
+        msg.toLowerCase().includes('currently loading')
+      ) {
+        await new Promise((res) => setTimeout(res, 2000))
+        continue
+      }
+      if ((data as any)?.estimated_time) {
+        await new Promise((res) => setTimeout(res, 2000))
+        continue
+      }
+
+      return data
+    } catch (e) {
+      lastErr = e
+      await new Promise((res) => setTimeout(res, 2000))
+    }
+  }
+  throw lastErr
 }
 
-// req.body の型赤線対策
-type ReqWithBody = VercelRequest & { body?: any };
+// ラベル -> 5分類マップ（暫定）
+function mapToFiveCategories(
+  label: string
+): 'casual' | 'smart' | 'feminine' | 'mode' | 'outdoor' {
+  const lower = label.toLowerCase()
+  if (/(outdoor|hiking|mountain|trek|parka|down)/.test(lower)) return 'outdoor'
+  if (/(dress|skirt|blouse|feminine|lace|floral)/.test(lower)) return 'feminine'
+  if (/(suit|blazer|oxford|derby|formal|smart)/.test(lower)) return 'smart'
+  if (/(leather|black|avant|mode|monochrome)/.test(lower)) return 'mode'
+  return 'casual'
+}
 
-export default async function handler(req: ReqWithBody, res: VercelResponse) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
-
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    const raw = req.body ?? {};
-    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    const { imageUrl } = (parsed as { imageUrl?: string });
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed' })
+    }
 
-    if (!imageUrl) return res.status(400).json({ error: 'imageUrl required' });
+    // --- body を安全にパース（赤線/型崩れ対策）---
+    let body: unknown = req.body ?? {}
+    if (typeof body === 'string') {
+      try {
+        body = JSON.parse(body)
+      } catch {
+        return res.status(400).json({ error: 'Invalid JSON body' })
+      }
+    }
+    const { imageUrl } = (body as { imageUrl?: string }) ?? {}
+    if (!imageUrl || typeof imageUrl !== 'string') {
+      return res.status(400).json({ error: 'Missing imageUrl' })
+    }
 
-    const ac = new AbortController();
-    const to = setTimeout(() => ac.abort(), 120_000);
+    // タイムアウト（120s）
+    const controller = new AbortController() as unknown as { signal: LooseAbortSignal; abort: () => void }
+    const timer = setTimeout(() => controller.abort(), 120_000)
 
-    const t0 = Date.now();
-    const buf = await fetchImageBuffer(imageUrl, ac.signal);
-    const labels = await classifyImage(buf, ac.signal);
-    clearTimeout(to);
+    // 画像取得 → HF 推論
+    const bytes = await fetchImageBytes(imageUrl, controller.signal)
+    const hf = await callHuggingFace(bytes, controller.signal)
 
-    const top5 = labels
-      .sort((a: any, b: any) => b.score - a.score)
-      .slice(0, 5)
-      .map((x: any) => ({ label: x.label, score: x.score }));
+    clearTimeout(timer)
+
+    // resnet-50 形式: [{label, score}, …]
+    const preds = Array.isArray(hf) ? (hf as Array<{ label: string; score: number }>) : []
+    if (!preds.length) {
+      return res.status(200).json({
+        ok: true,
+        category: 'casual',
+        ai_labels: { model: MODEL, raw: hf, note: 'empty predictions -> default casual' },
+      })
+    }
+
+    const top = preds[0]
+    const category = mapToFiveCategories(top.label)
 
     return res.status(200).json({
       ok: true,
-      model: MODEL,
-      imageUrl,
-      top5,
-      elapsedMs: Date.now() - t0,
-    });
-  } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'analyze failed' });
+      category, // ← posts.category の初期値に
+      ai_labels: {
+        model: MODEL,
+        top1: top,
+        top3: preds.slice(0, 3),
+        raw: preds,
+      },
+    })
+  } catch (err: any) {
+    // 常に JSON で返す（curl | jq が壊れない）
+    return res.status(200).json({
+      ok: false,
+      error: String(err?.message || err),
+    })
   }
 }

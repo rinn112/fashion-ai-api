@@ -1,146 +1,122 @@
 // api/resolve-product.ts
-import { createClient } from '@supabase/supabase-js';
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+export const config = { runtime: 'nodejs' };
 
-const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+};
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
-const UA =
-  'Mozilla/5.0 (compatible; FashionAI-Bot/1.0; +https://fashion-ai-api.vercel.app)';
-const FETCH_TIMEOUT_MS = 20_000;
-
-function withTimeout<T>(p: Promise<T>, ms: number) {
-  return new Promise<T>((resolve, reject) => {
-    const id = setTimeout(() => reject(new Error('fetch timeout')), ms);
-    p.then((v) => {
-      clearTimeout(id);
-      resolve(v);
-    }).catch((e) => {
-      clearTimeout(id);
-      reject(e);
-    });
-  });
+function resolveUrl(base: string, maybeRel: string): string {
+  try { return new URL(maybeRel, base).toString(); } catch { return maybeRel; }
 }
 
-function firstMatch(html: string, regexes: RegExp[]): string | undefined {
-  for (const r of regexes) {
-    const m = html.match(r);
-    if (m?.[1]) return decodeHTMLEntities(m[1]);
+function pickMeta(html: string, name: string): string | null {
+  const re = new RegExp(
+    `<meta[^>]+(?:property|name)=["']${name}["'][^>]+content=["']([^"']+)["'][^>]*>`,
+    'i'
+  );
+  const m = html.match(re);
+  return m ? m[1] : null;
+}
+
+function extractJsonLd(html: string): any | null {
+  const scripts = [...html.matchAll(
+    /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
+  )];
+  for (const s of scripts) {
+    try {
+      const obj = JSON.parse(s[1]);
+      const arr = Array.isArray(obj) ? obj : [obj];
+      for (const x of arr) {
+        const t = x?.['@type'];
+        const isProduct =
+          (typeof t === 'string' && t.toLowerCase() === 'product') ||
+          (Array.isArray(t) && t.includes('Product'));
+        if (isProduct) return x;
+      }
+    } catch { /* ignore */ }
   }
+  return null;
 }
 
-function decodeHTMLEntities(s: string) {
-  return s
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>');
-}
+function bestImgFromHtml(html: string, baseUrl: string): string | null {
+  const metas = [
+    pickMeta(html, 'og:image'),
+    pickMeta(html, 'twitter:image'),
+    pickMeta(html, 'twitter:image:src'),
+  ].filter(Boolean) as string[];
+  if (metas.length) return resolveUrl(baseUrl, metas[0]!);
 
-function absURL(maybe: string | undefined, base: string) {
-  if (!maybe) return undefined;
-  try {
-    return new URL(maybe, base).toString();
-  } catch {
-    return undefined;
+  const imgs = [...html.matchAll(
+    /<img[^>]+(?:src|data-src|data-original)=["']([^"']+)["'][^>]*>/gi
+  )].map(m => m[1]);
+  if (imgs.length) {
+    const cand = imgs.sort((a, b) => b.length - a.length)[0];
+    return resolveUrl(baseUrl, cand);
   }
-}
-
-function parsePrice(text?: string) {
-  if (!text) return undefined;
-  const m = text.replace(/[, ]/g, '').match(/(\d+(?:\.\d+)?)/);
-  return m ? Number(m[1]) : undefined;
+  return null;
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
-
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Max-Age', '86400');
+    return res.status(204).setHeader('Content-Length', '0').setHeader('Vary', 'Origin').setHeader('Access-Control-Allow-Credentials', 'true').setHeader('Access-Control-Allow-Origin', '*').setHeader('Access-Control-Allow-Headers', CORS['Access-Control-Allow-Headers']).setHeader('Access-Control-Allow-Methods', CORS['Access-Control-Allow-Methods']).end();
+  }
+  if (req.method !== 'POST') {
+    return res.status(405).setHeader('Allow', 'POST, OPTIONS').json({ ok: false, error: 'Method Not Allowed' });
+  }
   try {
-    const { url } = req.body || {};
-    if (!url) return res.status(400).json({ error: 'url required' });
+    const { url } = (typeof req.body === 'string' ? JSON.parse(req.body) : req.body) ?? {};
+    if (!url) throw new Error('missing url');
 
-    // 既存キャッシュ確認
-    const { data: cached } = await supabase.from('products').select('*').eq('url', url).maybeSingle();
-    if (cached) {
-      return res.status(200).json({ ok: true, product: cached, cache: 'hit' });
+    const r = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; FashionAppBot/1.0)',
+        'Accept': 'text/html,application/xhtml+xml',
+      }
+    });
+    if (!r.ok) throw new Error(`fetch failed: ${r.status}`);
+    const html = await r.text();
+
+    const jsonld = extractJsonLd(html);
+    let title = pickMeta(html, 'og:title') || pickMeta(html, 'twitter:title') || null;
+    let price: string | null = null;
+    let image = bestImgFromHtml(html, url);
+
+    if (jsonld) {
+      if (!title) title = jsonld.name || jsonld.title || null;
+      if (!image) {
+        const im = jsonld.image;
+        if (typeof im === 'string') image = resolveUrl(url, im);
+        else if (Array.isArray(im) && im.length) image = resolveUrl(url, im[0]);
+      }
+      const offers = Array.isArray(jsonld.offers) ? jsonld.offers[0] : jsonld.offers;
+      if (offers?.price) price = String(offers.price);
+      if (!price && offers?.priceSpecification?.price) price = String(offers.priceSpecification.price);
     }
 
-    // 取得
-    const resp = await withTimeout(
-      fetch(url, { headers: { 'user-agent': UA, accept: 'text/html,*/*' } }),
-      FETCH_TIMEOUT_MS
-    );
-    if (!resp.ok) {
-      return res.status(502).json({ error: `fetch failed: ${resp.status}` });
+    if (!title) {
+      const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+      title = m ? m[1].trim() : '商品';
     }
-    const html = await resp.text();
-
-    // Open Graph / Twitter Card / 一般メタ
-    const base = url;
-
-    const title =
-      firstMatch(html, [
-        /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["'][^>]*>/i,
-        /<meta[^>]+name=["']twitter:title["'][^>]+content=["']([^"']+)["'][^>]*>/i,
-        /<title[^>]*>([^<]+)<\/title>/i,
-      ]) || undefined;
-
-    const imageRel =
-      firstMatch(html, [
-        /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["'][^>]*>/i,
-        /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["'][^>]*>/i,
-        /<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']+)["'][^>]*>/i,
-      ]) || undefined;
-
-    const image = absURL(imageRel, base);
-
-    const priceText =
-      firstMatch(html, [
-        /<meta[^>]+property=["']product:price:amount["'][^>]+content=["']([^"']+)["'][^>]*>/i,
-        /<meta[^>]+itemprop=["']price["'][^>]+content=["']([^"']+)["'][^>]*>/i,
-        /"price"\s*:\s*"([^"]+)"/i, // JSON-LD fallback
-      ]) || undefined;
-
-    const brand =
-      firstMatch(html, [
-        /<meta[^>]+property=["']product:brand["'][^>]+content=["']([^"']+)["'][^>]*>/i,
-        /<meta[^>]+name=["']brand["'][^>]+content=["']([^"']+)["'][^>]*>/i,
-      ]) || undefined;
-
-    const faviconRel =
-      firstMatch(html, [
-        /<link[^>]+rel=["']icon["'][^>]+href=["']([^"']+)["'][^>]*>/i,
-        /<link[^>]+rel=["']shortcut icon["'][^>]+href=["']([^"']+)["'][^>]*>/i,
-      ]) || undefined;
-    const favicon = absURL(faviconRel, base);
-
-    const price = parsePrice(priceText);
 
     const product = {
       url,
       title,
       image,
       price,
-      brand,
-      favicon,
+      source: 'auto',
       fetched_at: new Date().toISOString(),
-      meta: { priceRaw: priceText },
     };
 
-    // UPSERT
-    const { error: upErr, data: up } = await supabase
-      .from('products')
-      .upsert(product, { onConflict: 'url' })
-      .select()
-      .maybeSingle();
-
-    if (upErr) return res.status(500).json({ error: upErr.message });
-
-    return res.status(200).json({ ok: true, product: up ?? product, cache: 'miss' });
+    return res.status(200)
+      .setHeader('Access-Control-Allow-Origin', '*')
+      .json({ ok: true, product });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message ?? 'resolve failed' });
+    return res.status(400)
+      .setHeader('Access-Control-Allow-Origin', '*')
+      .json({ ok: false, error: String(e?.message || e) });
   }
 }
