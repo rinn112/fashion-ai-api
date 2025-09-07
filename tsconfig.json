@@ -4,7 +4,10 @@
     "target": "es2022",
     "moduleResolution": "bundler",
     "strict": true,
-    "types": ["node"], 
+    "types": [
+      "node"
+    ],
     "skipLibCheck": true
-  }
+  },
+  "extends": "expo/tsconfig.base"
 }
