@@ -54,7 +54,7 @@ function parseProduct(html:string, base:string){
   const srcset = first(html,/<source[^>]+srcset=["']([^"']+)["']/i) || first(html,/<img[^>]+srcset=["']([^"']+)["']/i);
   push(srcset ? parseSrcset(srcset) : null);
   const imgAttrs=[...html.matchAll(/<img[^>]+(?:src|data-src|data-original|data-lazy|data-zoom-image)=["']([^"']+)["'][^>]*>/gi)].map(m=>m[1]);
-  if(imgAttrs.length) imgAttrs.sort((a,b)=>b.length-a.length).slice(0,6).forEach(u=>push(u));
+  if(imgAttrs.length) imgAttrs.sort((a,b)=>b.length-a-length).slice(0,6).forEach(u=>push(u));
   let image = cand.find(u=>/\.(?:jpg|jpeg|png|webp|avif)(?:\?|#|$)/i.test(u)) || cand[0] || null;
 
   if(!image){
