@@ -1,6 +1,6 @@
 // api/resolve-product.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-export const config = { runtime: 'nodejs' };
+export const config = { runtime: 'nodejs20.x' };
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -36,7 +36,7 @@ function extractJsonLd(html: string): any | null {
           (Array.isArray(t) && t.includes('Product'));
         if (isProduct) return x;
       }
-    } catch { /* ignore */ }
+    } catch { /* ignore broken JSON-LD */ }
   }
   return null;
 }
@@ -60,24 +60,46 @@ function bestImgFromHtml(html: string, baseUrl: string): string | null {
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Max-Age', '86400');
-    return res.status(204).setHeader('Content-Length', '0').setHeader('Vary', 'Origin').setHeader('Access-Control-Allow-Credentials', 'true').setHeader('Access-Control-Allow-Origin', '*').setHeader('Access-Control-Allow-Headers', CORS['Access-Control-Allow-Headers']).setHeader('Access-Control-Allow-Methods', CORS['Access-Control-Allow-Methods']).end();
-  }
-  if (req.method !== 'POST') {
-    return res.status(405).setHeader('Allow', 'POST, OPTIONS').json({ ok: false, error: 'Method Not Allowed' });
-  }
   try {
-    const { url } = (typeof req.body === 'string' ? JSON.parse(req.body) : req.body) ?? {};
-    if (!url) throw new Error('missing url');
+    if (req.method === 'OPTIONS') {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Headers', CORS['Access-Control-Allow-Headers']);
+      res.setHeader('Access-Control-Allow-Methods', CORS['Access-Control-Allow-Methods']);
+      return res.status(204).end();
+    }
+    if (req.method !== 'POST') {
+      return res.status(405).setHeader('Allow', 'POST, OPTIONS').json({ ok: false, error: 'Method Not Allowed' });
+    }
+
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const url = body?.url;
+    if (!url) return res.status(400).setHeader('Access-Control-Allow-Origin', '*').json({ ok: false, error: 'missing url' });
+
+    // fetch にタイムアウト
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), 12000);
 
     const r = await fetch(url, {
+      method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; FashionAppBot/1.0)',
+        'User-Agent': 'Mozilla/5.0 (compatible; FashionAppBot/1.0; +https://vercel.com)',
         'Accept': 'text/html,application/xhtml+xml',
-      }
-    });
-    if (!r.ok) throw new Error(`fetch failed: ${r.status}`);
+        'Accept-Language': 'ja,en;q=0.8',
+      },
+      redirect: 'follow',
+      signal: ac.signal,
+    }).catch((e) => {
+      throw new Error(`fetch failed: ${String(e?.message || e)}`);
+    }) as Response;
+    clearTimeout(to);
+
+    if (!r || !('ok' in r)) {
+      return res.status(502).setHeader('Access-Control-Allow-Origin', '*').json({ ok: false, error: 'invalid fetch response' });
+    }
+    if (!r.ok) {
+      return res.status(502).setHeader('Access-Control-Allow-Origin', '*').json({ ok: false, error: `upstream ${r.status}` });
+    }
+
     const html = await r.text();
 
     const jsonld = extractJsonLd(html);
@@ -111,12 +133,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       fetched_at: new Date().toISOString(),
     };
 
-    return res.status(200)
-      .setHeader('Access-Control-Allow-Origin', '*')
-      .json({ ok: true, product });
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    return res.status(200).json({ ok: true, product });
   } catch (e: any) {
-    return res.status(400)
-      .setHeader('Access-Control-Allow-Origin', '*')
-      .json({ ok: false, error: String(e?.message || e) });
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 }
